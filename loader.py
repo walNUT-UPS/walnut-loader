@@ -1,12 +1,96 @@
 #!/usr/bin/env python3
-# Ultra-light interactive loader for walNUT-style drivers
-# Place next to: plugin.yaml, driver.py, optional .venv/, config.yaml/json, secrets.yaml/json
-# Run: python3 loader.py
+"""
+walNUT Integration Plugin Loader and Validator
 
-import json, os, sys, time, importlib.util
+This loader mirrors walNUT's exact validation pipeline and import structure:
+- Schema validation using the same JSON schema
+- Driver import with plugin venv isolation matching walNUT's system
+- Capability conformance validation
+- Method signature validation
+- test_connection requirement validation
+
+Place next to: plugin.yaml, driver.py, optional .venv/, config.yaml/json, secrets.yaml/json
+Run: python3 loader.py
+"""
+
+import json, os, sys, time, importlib.util, inspect
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+# ---------- walNUT's plugin manifest schema (subset) ----------
+PLUGIN_MANIFEST_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["id", "name", "version", "min_core_version", "category", "schema", "capabilities", "driver"],
+    "additionalProperties": False,
+    "properties": {
+        "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z][a-z0-9]*)*$"
+        },
+        "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+        },
+        "version": {
+            "type": "string",
+            "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+        },
+        "min_core_version": {
+            "type": "string",
+            "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+        },
+        "category": {
+            "type": "string",
+            "enum": ["host-orchestrator", "ups-management", "power-control", "network-device", "smart-home", "monitoring", "notification", "storage", "compute"]
+        },
+        "driver": {
+            "type": "object",
+            "required": ["entrypoint"],
+            "properties": {
+                "entrypoint": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*:[a-zA-Z_][a-zA-Z0-9_]*$"
+                }
+            }
+        },
+        "schema": {
+            "type": "object",
+            "required": ["connection"],
+            "properties": {
+                "connection": {
+                    "type": "object"
+                }
+            }
+        },
+        "capabilities": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["id", "verbs", "targets"],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$"
+                    },
+                    "verbs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}
+                    },
+                    "targets": {
+                        "type": "array", 
+                        "minItems": 1,
+                        "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}
+                    }
+                }
+            }
+        }
+    }
+}
 
 # ---------- minimal YAML/JSON loader ----------
 def _load_yaml_or_json(path: Path) -> dict:
@@ -30,6 +114,53 @@ def _save_yaml_or_json(path: Path, data: dict):
     except Exception:
         path.write_text(json.dumps(data, indent=2))
 
+# ---------- walNUT-style schema validation ----------
+def validate_plugin_manifest(manifest_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate plugin.yaml using walNUT's exact schema validation logic."""
+    try:
+        from jsonschema import Draft202012Validator
+        validator = Draft202012Validator(PLUGIN_MANIFEST_SCHEMA)
+        errors = list(validator.iter_errors(manifest_data))
+        
+        if errors:
+            formatted_errors = []
+            for error in errors:
+                formatted_errors.append({
+                    "path": ".".join(str(p) for p in error.absolute_path),
+                    "message": error.message,
+                    "value": error.instance
+                })
+            return {"valid": False, "errors": formatted_errors}
+        
+        return {"valid": True, "errors": []}
+        
+    except ImportError:
+        return {
+            "valid": False,
+            "errors": [{
+                "path": "",
+                "message": "Schema validation unavailable. Install 'jsonschema' to enable manifest checks.",
+                "value": None
+            }]
+        }
+
+# ---------- walNUT-style capability conformance validation ----------
+def validate_capability_conformance(capabilities: List[Dict[str, Any]], driver_methods: Set[str]) -> Dict[str, Any]:
+    """Validate that driver methods match declared capabilities."""
+    errors = []
+    
+    for cap in capabilities:
+        cap_id = cap.get("id", "")
+        method_name = cap_id.replace(".", "_")
+        
+        if method_name not in driver_methods:
+            errors.append(f"Driver missing method '{method_name}' for capability '{cap_id}'")
+    
+    return {
+        "conformant": len(errors) == 0,
+        "errors": errors
+    }
+
 # ---------- simple secret prompt ----------
 def prompt_secret(label: str) -> str:
     try:
@@ -39,7 +170,7 @@ def prompt_secret(label: str) -> str:
         # fallback if getpass console not available
         return input(f"{label}: ")
 
-# ---------- tiny shims ----------
+# ---------- tiny shims matching walNUT's interface ----------
 @dataclass
 class IntegrationInstance:
     id: str = "inst-TEST"
@@ -55,25 +186,83 @@ class Target:
     attrs: Dict[str, Any] = field(default_factory=dict)
     labels: Dict[str, Any] = field(default_factory=dict)
 
-# ---------- per-plugin .venv path scoping ----------
-class PluginVenvPath:
-    def __init__(self, plugin_dir: Path): self.plugin_dir, self.added = plugin_dir, []
+# ---------- walNUT's plugin venv isolation system ----------
+def _candidate_site_packages(venv_dir: Path) -> List[Path]:
+    """Get candidate site-packages paths matching walNUT's logic."""
+    paths: List[Path] = []
+    # Linux/macOS style: .venv/lib/pythonX.Y/site-packages or lib64
+    lib_dir = venv_dir / "lib"
+    if lib_dir.exists():
+        for child in lib_dir.iterdir():
+            if child.is_dir() and child.name.startswith("python"):
+                sp = child / "site-packages"
+                if sp.exists():
+                    paths.append(sp)
+        # lib64 variant
+        lib64_dir = venv_dir / "lib64"
+        if lib64_dir.exists():
+            for child in lib64_dir.iterdir():
+                if child.is_dir() and child.name.startswith("python"):
+                    sp = child / "site-packages"
+                    if sp.exists():
+                        paths.append(sp)
+    # Windows style: .venv/Lib/site-packages
+    win_sp = venv_dir / "Lib" / "site-packages"
+    if win_sp.exists():
+        paths.append(win_sp)
+    # Ensure uniqueness while preserving order
+    seen = set()
+    unique_paths: List[Path] = []
+    for p in paths:
+        if str(p) not in seen:
+            seen.add(str(p))
+            unique_paths.append(p)
+    return unique_paths
+
+def get_plugin_site_packages(plugin_dir: Path) -> List[Path]:
+    """Return a list of extra import paths for a plugin matching walNUT's logic."""
+    paths: List[Path] = []
+    venv_dir = plugin_dir / ".venv"
+    if venv_dir.exists() and venv_dir.is_dir():
+        paths.extend(_candidate_site_packages(venv_dir))
+    # Fallback vendor directories (no venv)
+    vendor_dir = plugin_dir / "_vendor"
+    if vendor_dir.exists() and vendor_dir.is_dir():
+        paths.append(vendor_dir)
+    vendor_dir2 = plugin_dir / "vendor"
+    if vendor_dir2.exists() and vendor_dir2.is_dir():
+        paths.append(vendor_dir2)
+    # Ensure uniqueness
+    seen = set()
+    unique: List[Path] = []
+    for p in paths:
+        if str(p) not in seen:
+            seen.add(str(p))
+            unique.append(p)
+    return unique
+
+class PluginImportPath:
+    """Context manager matching walNUT's plugin_import_path exactly."""
+    def __init__(self, plugin_dir: Path): 
+        self.plugin_dir = plugin_dir
+        self.removed = []
+    
     def __enter__(self):
-        venv = self.plugin_dir / ".venv"
-        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        candidates = [
-            venv / "lib" / pyver / "site-packages",  # POSIX
-            venv / "Lib" / "site-packages",          # Windows
-        ]
-        for p in candidates:
-            if p.exists():
-                sys.path.insert(0, str(p)); self.added.append(str(p))
-        sys.path.insert(0, str(self.plugin_dir)); self.added.append(str(self.plugin_dir))
+        to_add = [str(p) for p in get_plugin_site_packages(self.plugin_dir)]
+        for p in reversed(to_add):  # keep original order when inserting at front
+            if p not in sys.path:
+                sys.path.insert(0, p)
+                self.removed.append(p)
         return self
+    
     def __exit__(self, *exc):
-        for p in reversed(self.added):
-            try: sys.path.remove(p)
-            except ValueError: pass
+        # Remove only what we added
+        for p in self.removed:
+            try:
+                if p in sys.path:
+                    sys.path.remove(p)
+            except Exception:
+                pass
 
 # ---------- driver load ----------
 def load_manifest(here: Path) -> dict:
@@ -211,10 +400,49 @@ def interactive_loop(here: Path):
         if idx is None: return
         inv_type = choices[idx]
         active = input("Active-only? [Y/n]: ").strip().lower() not in ("n","no","0")
+        
+        # Smart site_id handling for UX improvement
+        options = None
+        site_dependent_types = {"device", "port"}
+        
+        if inv_type in site_dependent_types:
+            print(f"\n{inv_type.title()} listing requires a site. Let me get available sites first...")
+            try:
+                sites = driver.inventory_list("site", active_only=True, options=None) or []
+                if not sites:
+                    print("No sites found. Cannot list devices/clients/vouchers."); return
+                elif len(sites) == 1:
+                    site_id = sites[0].get("external_id") or sites[0].get("id")
+                    site_name = sites[0].get("name", "Unknown")
+                    print(f"Using site: {site_name} ({site_id})")
+                    options = {"site_id": site_id}
+                else:
+                    print(f"Found {len(sites)} sites:")
+                    site_choices = [f"{s.get('name', 'Unknown')} ({s.get('external_id') or s.get('id')})" for s in sites]
+                    site_idx = choose_idx("Select site", site_choices)
+                    if site_idx is None: return
+                    site_id = sites[site_idx].get("external_id") or sites[site_idx].get("id")
+                    options = {"site_id": site_id}
+            except Exception as e:
+                print(f"Error getting sites: {e}")
+                # Fallback to manual options input (backward compatibility)
+                opts_txt = input("Options JSON (site_id required): ").strip()
+                try:
+                    options = json.loads(opts_txt) if opts_txt else None
+                except Exception as e:
+                    print(f"Invalid JSON: {e}"); return
+        else:
+            # For site inventory or custom options
+            opts_txt = input("Options JSON (or blank): ").strip()
+            try:
+                options = json.loads(opts_txt) if opts_txt else None
+            except Exception as e:
+                print(f"Invalid JSON: {e}"); return
+        
         if not hasattr(driver,"inventory_list"):
             print("Driver lacks inventory_list()"); return
         try:
-            items = driver.inventory_list(inv_type, active_only=active, options=None) or []
+            items = driver.inventory_list(inv_type, active_only=active, options=options) or []
             print(f"\n{inv_type} count={len(items)}")
             for it in items:
                 t = it.get("type", inv_type)
